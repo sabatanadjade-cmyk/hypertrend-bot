@@ -1,156 +1,181 @@
 """
-╔══════════════════════════════════════════════════════════════╗
-║          HyperTrend Bot - Binance Spot Only                  ║
-║  يتبع إشارات مؤشر HyperTrend Pro على فريمات 1-15 دقيقة     ║
-╚══════════════════════════════════════════════════════════════╝
-
-المنطق:
-- يراقب عدة فريمات (1د، 3د، 5د، 15د)
-- يدخل فقط إذا تأكدت الإشارة على فريمين أو أكثر
-- 50% من الكمية يخرج عند TP1
-- 25% عند TP2 ، 25% عند TP3
-- وقف الخسارة يتحرك إلى نقطة الدخول بعد تحقق TP1
+HyperTrend Bot - بوت التداول التلقائي
+يراقب قناة تلجرام للحيتان + مؤشر HyperTrend
 """
 
 import os
 import time
 import logging
-import math
-from datetime import datetime
+import asyncio
+import re
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
-from dotenv import load_dotenv
 from signal_engine import SignalEngine
 from trade_manager import TradeManager
 
-# ── إعداد اللوج ────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)s | %(message)s',
-    handlers=[
-        logging.FileHandler('bot.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 log = logging.getLogger(__name__)
 
-load_dotenv()
+API_KEY          = os.getenv("BINANCE_API_KEY", "")
+API_SECRET       = os.getenv("BINANCE_API_SECRET", "")
+TESTNET          = os.getenv("BINANCE_TESTNET", "false").lower() == "true"
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "@KdrxWhale")
 
-# ── الإعدادات ──────────────────────────────────────────────
-SYMBOLS   = []          # يتملى من ملف symbols.txt
-TIMEFRAMES = ['1m', '3m', '5m', '15m']
-MIN_CONFIRM = 2         # عدد الفريمات التي يجب تأكيد الإشارة فيها
-LOOP_SLEEP  = 30        # ثواني بين كل دورة فحص
+TIMEFRAMES    = ["1m", "3m", "5m", "15m"]
+MIN_CONFIRM   = 2
+SCAN_INTERVAL = 30
+WHALE_INTERVAL = 60
+
+DEFAULT_SYMBOLS = [
+    "SOLUSDT","XRPUSDT","DOGEUSDT","ADAUSDT","SUIUSDT","AVAXUSDT",
+    "LINKUSDT","DOTUSDT","ARBUSDT","NEARUSDT","LTCUSDT","XLMUSDT",
+    "OPUSDT","APTUSDT","ATOMUSDT","ALGOUSDT","FILUSDT","GRTUSDT",
+    "TONUSDT","VETUSDT","ICPUSDT","BCHUSDT","ETCUSDT","QNTUSDT",
+    "EGLDUSDT","IMXUSDT","RENDERUSDT","FETUSDT","INJUSDT","MATICUSDT"
+]
 
 def load_symbols():
-    """تحميل قائمة العملات من ملف symbols.txt"""
-    path = 'symbols.txt'
-    if not os.path.exists(path):
-        # قائمة افتراضية حلال (بدون ستيبل كوين ضد ستيبل كوين)
-        defaults = [
-            'BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'SOLUSDT',
-            'ADAUSDT', 'DOTUSDT', 'LINKUSDT', 'AVAXUSDT',
-            'MATICUSDT', 'ATOMUSDT', 'NEARUSDT', 'FTMUSDT'
-        ]
-        with open(path, 'w') as f:
-            f.write('\n'.join(defaults))
-        log.info(f"تم إنشاء symbols.txt بـ {len(defaults)} عملة افتراضية")
-        return defaults
-    with open(path) as f:
-        syms = [l.strip().upper() for l in f if l.strip() and not l.startswith('#')]
-    log.info(f"تم تحميل {len(syms)} عملة من symbols.txt")
-    return syms
-
-
-def get_balance(client, asset='USDT'):
-    """جلب الرصيد المتاح"""
     try:
-        bal = client.get_asset_balance(asset=asset)
-        return float(bal['free']) if bal else 0.0
-    except BinanceAPIException as e:
-        log.error(f"خطأ في جلب الرصيد: {e}")
-        return 0.0
+        with open("symbols.txt") as f:
+            syms = [s.strip() for s in f.read().splitlines() if s.strip()]
+        return syms if syms else DEFAULT_SYMBOLS
+    except:
+        return DEFAULT_SYMBOLS
 
+def extract_symbols_from_text(text):
+    text = text.upper()
+    found = []
+    patterns = [
+        r'\b([A-Z]{2,10})USDT\b',
+        r'\b([A-Z]{2,10})/USDT\b',
+        r'\$([A-Z]{2,10})\b',
+        r'#([A-Z]{2,10})\b',
+    ]
+    for pattern in patterns:
+        for m in re.findall(pattern, text):
+            symbol = m + "USDT" if not m.endswith("USDT") else m
+            if symbol not in found:
+                found.append(symbol)
+    return found
+
+async def get_whale_signals():
+    if not TELEGRAM_TOKEN:
+        return []
+    try:
+        import aiohttp
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as resp:
+                data = await resp.json()
+        symbols = []
+        if data.get("ok") and data.get("result"):
+            for update in data["result"][-20:]:
+                msg = update.get("message") or update.get("channel_post")
+                if msg:
+                    chat = msg.get("chat", {})
+                    if TELEGRAM_CHANNEL.replace("@", "") in chat.get("username", ""):
+                        found = extract_symbols_from_text(msg.get("text", ""))
+                        symbols.extend(found)
+        return list(set(symbols))
+    except Exception as e:
+        log.warning(f"Telegram error: {e}")
+        return []
 
 def main():
     log.info("=" * 60)
-    log.info("  HyperTrend Bot بدأ التشغيل")
+    log.info("🤖 بدأ تشغيل HyperTrend Bot")
+    log.info(f"🌐 الوضع: {'TESTNET تجريبي' if TESTNET else 'REAL حقيقي'}")
+    log.info(f"📡 قناة الحيتان: {TELEGRAM_CHANNEL}")
     log.info("=" * 60)
 
-    # الاتصال بـ Binance
-    api_key    = os.getenv('BINANCE_API_KEY', '')
-    api_secret = os.getenv('BINANCE_API_SECRET', '')
-
-    if not api_key or not api_secret:
-        log.error("❌ لم يتم إيجاد BINANCE_API_KEY أو BINANCE_API_SECRET في ملف .env")
+    try:
+        if TESTNET:
+            client = Client(API_KEY, API_SECRET, testnet=True)
+            client.API_URL = "https://testnet.binance.vision/api"
+            log.info("✅ متصل بـ Binance Testnet")
+        else:
+            client = Client(API_KEY, API_SECRET)
+            log.info("✅ متصل بـ Binance الحقيقي")
+        client.get_account()
+        log.info("✅ حساب Binance يعمل")
+    except Exception as e:
+        log.error(f"❌ خطأ الاتصال: {e}")
+        time.sleep(30)
         return
 
-    client = Client(api_key, api_secret)
-    log.info("✅ تم الاتصال بـ Binance بنجاح")
-
-    # تحميل العملات
     symbols = load_symbols()
+    log.info(f"📊 عدد العملات: {len(symbols)}")
 
-    # مدير الإشارات
-    signal_engine = SignalEngine(client, TIMEFRAMES, MIN_CONFIRM)
+    engine  = SignalEngine(client, TIMEFRAMES, MIN_CONFIRM)
+    manager = TradeManager(client, testnet=TESTNET)
 
-    # مدير الصفقات
-    trade_manager = TradeManager(client)
-
-    log.info(f"📊 يراقب {len(symbols)} عملة على فريمات: {TIMEFRAMES}")
-    log.info(f"✅ الحد الأدنى للتأكيد: {MIN_CONFIRM} فريمات")
-    log.info("-" * 60)
+    whale_symbols    = []
+    last_whale_check = 0
+    scan_count       = 0
 
     while True:
         try:
-            # تحقق من الصفقات المفتوحة أولاً
-            trade_manager.check_open_trades()
+            scan_count += 1
+            now = time.time()
 
-            # حساب الرصيد المتاح
-            balance = get_balance(client, 'USDT')
-            log.info(f"💰 الرصيد المتاح: {balance:.2f} USDT")
+            if now - last_whale_check > WHALE_INTERVAL:
+                log.info("🐋 فحص قناة الحيتان...")
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    whale_symbols = loop.run_until_complete(get_whale_signals())
+                    loop.close()
+                    if whale_symbols:
+                        log.info(f"🐋 عملات الحيتان: {whale_symbols}")
+                except Exception as e:
+                    log.warning(f"خطأ الحيتان: {e}")
+                last_whale_check = now
 
-            if balance < 10:
-                log.warning("⚠️  الرصيد أقل من 10 USDT - لا يمكن فتح صفقات جديدة")
-                time.sleep(LOOP_SLEEP)
-                continue
+            scan_symbols = whale_symbols + [s for s in symbols if s not in whale_symbols]
+            log.info(f"🔍 فحص #{scan_count} — {len(scan_symbols)} عملة")
 
-            # فحص الإشارات لكل عملة
-            for symbol in symbols:
-                # تخطي العملات التي عندها صفقة مفتوحة
-                if trade_manager.has_open_trade(symbol):
-                    continue
+            best_signal = None
+            best_score  = 0
 
-                signal = signal_engine.analyze(symbol)
+            for symbol in scan_symbols[:50]:
+                try:
+                    signal = engine.analyze(symbol)
+                    if signal and signal.get("score", 0) > best_score:
+                        best_score  = signal["score"]
+                        best_signal = signal
+                        best_signal["symbol"] = symbol
+                        best_signal["whale"]  = symbol in whale_symbols
+                except:
+                    pass
 
-                if signal and signal['type'] == 'BUY':
-                    log.info(f"🚀 إشارة شراء على {symbol} | "
-                             f"تأكيد على {signal['confirmed_tf']} فريمات | "
-                             f"ADX: {signal['adx']:.1f}")
+            if best_signal and best_score >= MIN_CONFIRM:
+                sym = best_signal["symbol"]
+                tag = "🐋 حوت + " if best_signal.get("whale") else ""
+                log.info(f"✅ إشارة {tag}{best_signal['direction']} على {sym} (نقاط: {best_score})")
+                try:
+                    result = manager.execute_trade(best_signal)
+                    if result:
+                        log.info(f"📈 تم الدخول: {sym} | {result}")
+                except Exception as e:
+                    log.warning(f"خطأ التداول: {e}")
+            else:
+                log.info("⏳ لا توجد إشارة كافية الآن")
 
-                    # فتح الصفقة بكل الرصيد المتاح
-                    trade_manager.open_trade(
-                        symbol   = symbol,
-                        balance  = balance,
-                        entry    = signal['entry'],
-                        stop     = signal['stop'],
-                        tp1      = signal['tp1'],
-                        tp2      = signal['tp2'],
-                        tp3      = signal['tp3'],
-                        timeframe= signal['best_tf']
-                    )
-                    # تحديث الرصيد بعد الدخول
-                    balance = get_balance(client, 'USDT')
+            try:
+                manager.manage_open_trades()
+            except Exception as e:
+                log.warning(f"خطأ إدارة الصفقات: {e}")
 
-            time.sleep(LOOP_SLEEP)
+            log.info(f"⏰ انتظار {SCAN_INTERVAL} ثانية...")
+            time.sleep(SCAN_INTERVAL)
 
         except KeyboardInterrupt:
-            log.info("🛑 تم إيقاف البوت يدوياً")
+            log.info("🛑 تم إيقاف البوت")
             break
         except Exception as e:
-            log.error(f"خطأ غير متوقع: {e}", exc_info=True)
-            time.sleep(10)
+            log.error(f"❌ خطأ: {e}")
+            time.sleep(30)
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
