@@ -1,6 +1,7 @@
 """
 HyperTrend Bot - بوت التداول التلقائي
 يراقب قناة تلجرام للحيتان + مؤشر HyperTrend
+مع إشعارات Telegram لكل صفقة
 """
 
 import os
@@ -8,6 +9,7 @@ import time
 import logging
 import asyncio
 import re
+import requests
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from signal_engine import SignalEngine
@@ -21,10 +23,11 @@ API_SECRET       = os.getenv("BINANCE_API_SECRET", "")
 TESTNET          = os.getenv("BINANCE_TESTNET", "false").lower() == "true"
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "@KdrxWhale")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "5569601833")
 
-TIMEFRAMES    = ["1m", "3m", "5m", "15m"]
-MIN_CONFIRM   = 2
-SCAN_INTERVAL = 30
+TIMEFRAMES     = ["1m", "3m", "5m", "15m"]
+MIN_CONFIRM    = 2
+SCAN_INTERVAL  = 30
 WHALE_INTERVAL = 60
 
 DEFAULT_SYMBOLS = [
@@ -34,6 +37,19 @@ DEFAULT_SYMBOLS = [
     "TONUSDT","VETUSDT","ICPUSDT","BCHUSDT","ETCUSDT","QNTUSDT",
     "EGLDUSDT","IMXUSDT","RENDERUSDT","FETUSDT","INJUSDT","MATICUSDT"
 ]
+
+def send_telegram(message: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        }, timeout=10)
+    except Exception as e:
+        log.warning(f"خطأ إرسال Telegram: {e}")
 
 def load_symbols():
     try:
@@ -89,6 +105,13 @@ def main():
     log.info(f"📡 قناة الحيتان: {TELEGRAM_CHANNEL}")
     log.info("=" * 60)
 
+    send_telegram(
+        f"🤖 <b>HyperTrend Bot بدأ التشغيل</b>\n"
+        f"🌐 الوضع: {'TESTNET تجريبي' if TESTNET else 'REAL حقيقي'}\n"
+        f"📡 قناة الحيتان: {TELEGRAM_CHANNEL}\n"
+        f"⏰ كل 30 ثانية يفحص 221 عملة"
+    )
+
     try:
         if TESTNET:
             client = Client(API_KEY, API_SECRET, testnet=True)
@@ -101,6 +124,7 @@ def main():
         log.info("✅ حساب Binance يعمل")
     except Exception as e:
         log.error(f"❌ خطأ الاتصال: {e}")
+        send_telegram(f"❌ خطأ الاتصال بـ Binance: {e}")
         time.sleep(30)
         return
 
@@ -128,6 +152,7 @@ def main():
                     loop.close()
                     if whale_symbols:
                         log.info(f"🐋 عملات الحيتان: {whale_symbols}")
+                        send_telegram(f"🐋 <b>عملات الحيتان:</b> {', '.join(whale_symbols)}")
                 except Exception as e:
                     log.warning(f"خطأ الحيتان: {e}")
                 last_whale_check = now
@@ -150,15 +175,35 @@ def main():
                     pass
 
             if best_signal and best_score >= MIN_CONFIRM:
-                sym = best_signal["symbol"]
-                tag = "🐋 حوت + " if best_signal.get("whale") else ""
+                sym   = best_signal["symbol"]
+                tag   = "🐋 حوت + " if best_signal.get("whale") else ""
+                entry = best_signal.get("entry", 0)
+                stop  = best_signal.get("stop", 0)
+                tp1   = best_signal.get("tp1", 0)
+                tp2   = best_signal.get("tp2", 0)
+                tp3   = best_signal.get("tp3", 0)
+
                 log.info(f"✅ إشارة {tag}{best_signal['direction']} على {sym} (نقاط: {best_score})")
+
+                send_telegram(
+                    f"✅ <b>إشارة {tag}{best_signal['direction']}</b>\n"
+                    f"💎 العملة: <b>{sym}</b>\n"
+                    f"📥 دخول: <b>{entry:.4f}</b>\n"
+                    f"🛑 وقف الخسارة: <b>{stop:.4f}</b>\n"
+                    f"🎯 TP1: <b>{tp1:.4f}</b>\n"
+                    f"🎯 TP2: <b>{tp2:.4f}</b>\n"
+                    f"🎯 TP3: <b>{tp3:.4f}</b>\n"
+                    f"⭐ نقاط: {best_score}"
+                )
+
                 try:
                     result = manager.execute_trade(best_signal)
                     if result:
                         log.info(f"📈 تم الدخول: {sym} | {result}")
+                        send_telegram(f"📈 <b>تم الدخول في {sym}</b>\n{result}")
                 except Exception as e:
                     log.warning(f"خطأ التداول: {e}")
+                    send_telegram(f"⚠️ خطأ التداول {sym}: {e}")
             else:
                 log.info("⏳ لا توجد إشارة كافية الآن")
 
@@ -172,9 +217,11 @@ def main():
 
         except KeyboardInterrupt:
             log.info("🛑 تم إيقاف البوت")
+            send_telegram("🛑 تم إيقاف البوت")
             break
         except Exception as e:
             log.error(f"❌ خطأ: {e}")
+            send_telegram(f"❌ خطأ في البوت: {e}")
             time.sleep(30)
 
 if __name__ == "__main__":
